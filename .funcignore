@@ -1,0 +1,12 @@
+.git*
+.venv
+.vscode
+__pycache__
+.pytest_cache
+tests
+terraform
+local.settings.json
+.env
+.env.example
+README.md
+requirements-dev.txt

@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Terraform
+# Keep .terraform.lock.hcl: it pins provider versions and their hashes.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+!terraform/environments/*.tfvars
+crash.log
+
+# Azure Functions
+local.settings.json
+.python_packages/
