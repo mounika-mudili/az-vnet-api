@@ -1,0 +1,115 @@
+name: Deploy
+
+# Infrastructure first, then the code. Both jobs sign in with OIDC, so no secrets here.
+#
+# Variables on the 'prod' GitHub environment:
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID  deploying app registration
+#   API_CLIENT_ID                                            registration protecting the API
+#   TF_STATE_RESOURCE_GROUP, TF_STATE_STORAGE_ACCOUNT        from bootstrap-state.sh
+#   TF_STATE_CONTAINER
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TERRAFORM_VERSION: "1.9.8"
+  PYTHON_VERSION: "3.11"
+  TF_ENVIRONMENT: prod
+  # value of terraform/config/prod.backend.hcl\
+  TF_STATE_KEY: az-vnet-api/prod.tfstate
+
+jobs:
+  infrastructure:
+    name: Terraform
+    runs-on: ubuntu-latest
+    environment: prod
+    outputs:
+      function_app_name: ${{ steps.output.outputs.function_app_name }}
+      api_resource_group: ${{ steps.output.outputs.api_resource_group }}
+      api_base_url: ${{ steps.output.outputs.api_base_url }}
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}"
+
+      # Ids come from the environment, not the committed tfvars.
+      - name: Plan
+        run: |
+          terraform plan -out=tfplan -input=false \
+            -var-file="environments/${{ env.TF_ENVIRONMENT }}.tfvars" \
+            -var="subscription_id=${{ vars.AZURE_SUBSCRIPTION_ID }}" \
+            -var="tenant_id=${{ vars.AZURE_TENANT_ID }}" \
+            -var="api_client_id=${{ vars.API_CLIENT_ID }}"
+
+      - name: Show plan
+        run: terraform show -no-color tfplan >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Read outputs
+        id: output
+        run: |
+          {
+            echo "function_app_name=$(terraform output -raw function_app_name)"
+            echo "api_resource_group=$(terraform output -raw api_resource_group)"
+            echo "api_base_url=$(terraform output -raw api_base_url)"
+          } >> "$GITHUB_OUTPUT"
+
+  code:
+    name: Function app
+    needs: infrastructure
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Oryx installs requirements.txt on the Azure side.
+      - uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ needs.infrastructure.outputs.function_app_name }}
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
+
+      - name: Health check
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if curl --fail --silent --show-error "${{ needs.infrastructure.outputs.api_base_url }}/health"; then
+              exit 0
+            fi
+            echo "health check not ready, retrying in 10s"
+            sleep 10
+          done
+          echo "API did not become healthy" >&2
+          exit 1
